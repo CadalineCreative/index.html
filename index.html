@@ -312,6 +312,7 @@ header .nav button:disabled{opacity:.3}
   <button class="secondary" id="expJson">⬇︎ Download JSON backup (full restore)</button>
   <button class="secondary" id="impJson">⬆︎ Restore from JSON backup…</button>
   <input type="file" id="impFile" accept=".json,application/json" style="display:none">
+  <div class="hint" id="cloudNote"></div>
   <div class="hint" id="backupNote"></div>
   <div class="hint">iOS can evict a home-screen web app's local data if the app goes unopened for a long stretch. This holds tax records — back up regularly.</div>
 </div>
@@ -329,6 +330,7 @@ const DEFAULTS={
   },
   shifts:{},        // id -> shift
   checks:{},        // periodStartISO -> {actGross, actNet}
+  cloud:{last:null}, // last full cloud sweep sent (ms)
   lastBackup:null,
   nagSnooze:null
 };
@@ -339,7 +341,7 @@ function load(){
     // shallow-merge settings against defaults for forward compat
     s.settings=Object.assign(structuredClone(DEFAULTS.settings),s.settings||{});
     s.settings.shifts=Object.assign(structuredClone(DEFAULTS.settings.shifts),s.settings.shifts||{});
-    s.shifts=s.shifts||{}; s.checks=s.checks||{};
+    s.shifts=s.shifts||{}; s.checks=s.checks||{}; s.cloud=s.cloud||{last:null};
     return s;
   }catch(e){return structuredClone(DEFAULTS)}
 }
@@ -544,7 +546,7 @@ function openDay(d){
   list.onclick=e=>{
     const ed=e.target.getAttribute("data-edit"),del=e.target.getAttribute("data-del");
     if(ed)openTips(ed);
-    if(del&&confirm("Delete this scheduled shift?")){delete S.shifts[del];save();render();openDay(d)}
+    if(del&&confirm("Delete this scheduled shift?")){delete S.shifts[del];save();render();openDay(d);cloudDeleteShift(del)}
   };
   show("shDay");
 }
@@ -575,6 +577,7 @@ $("logSave").onclick=()=>{
   const s={id:uid(),date,type:logType,start:$("logStart").value,end:$("logEnd").value,logged:false};
   if(!s.start||!s.end){alert("Set start and end times.");return}
   S.shifts[s.id]=s;save();render();renderUpcoming();
+  cloudSyncShift(s);
 };
 function upcoming(){const now=new Date();
   return Object.values(S.shifts).filter(s=>!s.logged&&shiftEndDate(s)>=now)
@@ -592,7 +595,7 @@ function renderUpcoming(){
     el.appendChild(c);
   }
   el.onclick=e=>{const del=e.target.getAttribute("data-del");
-    if(del){delete S.shifts[del];save();render();renderUpcoming()}};
+    if(del){delete S.shifts[del];save();render();renderUpcoming();cloudDeleteShift(del)}};
   $("icsBtn").style.display=ups.length?"block":"none";
 }
 $("icsBtn").onclick=()=>downloadICS(upcoming());
@@ -660,8 +663,9 @@ $("tipsSave").onclick=()=>{
   Object.assign(s,{logged:true,actualStart:$("tStart").value,actualEnd:$("tEnd").value,
     hours:d.hours,cc:d.cc,cash:d.cash,food:d.food,alcohol:d.alcohol,bussers:d.bussers});
   save();hide();render();
+  cloudSyncShift(s);
 };
-$("tipsDelete").onclick=()=>{if(confirm("Delete this shift and its numbers?")){delete S.shifts[tipsId];save();hide();render()}};
+$("tipsDelete").onclick=()=>{if(confirm("Delete this shift and its numbers?")){const del=tipsId;delete S.shifts[del];save();hide();render();cloudDeleteShift(del)}};
 
 /* ---- Checks sheet ---- */
 function openChecks(){
@@ -706,6 +710,9 @@ function openSettings(){
   $("sRateNote").textContent=rateSource()==="calibrated"
     ?"Calibrated rate in use: "+(effRate()*100).toFixed(2)+"% (averaged from your real checks). The default above is only used before calibration."
     :"No real checks entered yet — using the default rate. FICA alone is 7.65%; federal income tax comes on top per your W-4.";
+  $("cloudNote").textContent="☁️ Google Sheets sync — last backed up: "+
+    (S.cloud.last?new Date(S.cloud.last).toLocaleString():"not yet")+
+    " · full sweep every 4 days on open, plus each entry as you save it. Timestamp = last sent while online; check the Sheet to confirm rows.";
   $("backupNote").textContent=S.lastBackup?"Last backup: "+new Date(S.lastBackup).toLocaleDateString():"No backup downloaded yet.";
   show("shSettings");
 }
@@ -861,13 +868,49 @@ $("expXlsx").onclick=()=>{
   downloadBlob(buildXLSX(y),"tips-"+y+".xlsx");
 };
 
+/* ============================== GOOGLE SHEETS CLOUD SYNC ============================== */
+/* Fire-and-forget POSTs to the user's Apps Script web app.
+   CORS-critical: Content-Type text/plain + mode:'no-cors' (application/json
+   would trigger a preflight Apps Script can't answer). no-cors responses are
+   opaque, so timestamps below mean "last sent while online", not server-confirmed. */
+const SYNC_URL="https://script.google.com/macros/s/AKfycby1phjOG9dl0ZZ6lXuS0P-rqBKMUfpDnkHcQlCPTp8y1yngAHiG0WCppBCA70Z3JpU0/exec";
+const r2=n=>Math.round((n||0)*100)/100;
+function cloudPost(payload){
+  if(!navigator.onLine)return false;
+  try{
+    fetch(SYNC_URL,{method:"POST",mode:"no-cors",
+      headers:{"Content-Type":"text/plain;charset=utf-8"},
+      body:JSON.stringify(payload)}).catch(()=>{});
+    return true;
+  }catch(e){return false}
+}
+function shiftRow(s){ // exact field names expected by the Apps Script columns
+  const m=shiftMath(s),ts=m.ts;
+  return{id:s.id,date:s.date,shiftType:s.type,hoursWorked:r2(s.hours),
+    ccTips:r2(s.cc),cashTips:r2(s.cash),foodSales:r2(s.food),alcoholSales:r2(s.alcohol),
+    busserCount:s.bussers||defaultBussers(s.date,s.type),
+    barTipshare:r2(ts.bar),busserTipshare:r2(ts.buss),totalTipshare:r2(ts.total),
+    grossEarned:r2(m.gross),netInPocket:r2(m.z),estWithholding:r2(m.withheld)};
+}
+function cloudSyncShift(s){if(s)cloudPost(shiftRow(s))}
+function cloudDeleteShift(id){if(id)cloudPost({action:"delete",id})}
+function cloudSweepCheck(){ // 4-day full-array safety net, enforced on open
+  const due=!S.cloud.last||(Date.now()-S.cloud.last)>=4*864e5;
+  if(!due)return;
+  const all=Object.values(S.shifts).sort((a,b)=>a.date<b.date?-1:1).map(shiftRow);
+  if(cloudPost(all)){S.cloud.last=Date.now();save();
+    if(openSheet==="shSettings")openSettings()}
+}
+
 /* ============================== NAV / INIT ============================== */
 $("prevM").onclick=()=>{if(view.m===0){view.y--;view.m=11}else view.m--;render()};
 $("nextM").onclick=()=>{if(view.m===11){view.y++;view.m=0}else view.m++;render()};
 $("btnLog").onclick=()=>openLog(null);
 $("btnTips").onclick=openTipsPicker;
-document.addEventListener("visibilitychange",()=>{if(!document.hidden)render()});
+document.addEventListener("visibilitychange",()=>{if(!document.hidden){render();cloudSweepCheck()}});
+window.addEventListener("online",cloudSweepCheck);
 render();
+cloudSweepCheck();
 </script>
 </body>
 </html>
